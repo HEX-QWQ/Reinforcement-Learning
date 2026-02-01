@@ -73,11 +73,11 @@ class DQNTrainer(BaseTrainer):
     
     def experience_replay(self,memory:ReplayBuffer,batch_size=32):
         obs,act,rew,next_obs,done = memory.sample(batch_size)
-        obs = torch.as_tensor(obs).float().to(self.device)
-        act = torch.as_tensor(act).long().to(self.device)
-        rew = torch.as_tensor(rew).float().to(self.device)
-        next_obs = torch.as_tensor(next_obs).float().to(self.device)
-        done = torch.as_tensor(done).float().to(self.device)
+        obs = torch.from_numpy(np.array(obs)).float().to(self.device)
+        act = torch.from_numpy(np.array(act)).long().to(self.device)
+        rew = torch.from_numpy(np.array(rew)).float().to(self.device)
+        next_obs = torch.from_numpy(np.array(next_obs)).float().to(self.device)
+        done = torch.from_numpy(np.array(done)).float().to(self.device)
         loss = self.train_step(obs,act,rew,next_obs,done)
         return loss
     
