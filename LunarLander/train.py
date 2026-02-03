@@ -1,41 +1,12 @@
 import time
 from collections import deque
-
 import torch
 import gymnasium as gym
+import numpy as np
 
-from algorithm.dqn import ActionValueNetwork
-from trainer.dqn_trainer import DQNTrainer, ReplayBuffer
-
-
-# =====================
-# Helper functions
-# =====================
-def to_float(x):
-    try:
-        if x is None:
-            return None
-        if torch.is_tensor(x):
-            return float(x.detach().cpu().item())
-        return float(x)
-    except Exception:
-        return None
-
-
-def unpack_train_result(out):
-    """
-    Compatible with different trainer implementations.
-    """
-    if out is None:
-        return {}
-    if isinstance(out, dict):
-        return {k: to_float(v) for k, v in out.items()}
-    if isinstance(out, (float, int)) or torch.is_tensor(out):
-        return {"loss": to_float(out)}
-    if isinstance(out, (tuple, list)) and len(out) > 0:
-        return {"loss": to_float(out[0])}
-    return {}
-
+from algorithm.dqn import DQN
+from agent.dqn_agent import DQNAgent
+from trainer.base_trainer import Trainer, ReplayBuffer
 
 # =====================
 # Hyperparameters
@@ -44,7 +15,7 @@ learning_rate = 1e-3
 n_episodes = 100_000
 
 start_epsilon = 1.0
-epsilon_decay = 0.99
+epsilon_decay = 0.995
 final_epsilon = 0.01
 
 gamma = 0.99
@@ -52,14 +23,14 @@ target_update_freq = 100
 grad_clip_norm = 10.0
 
 replay_capacity = 100_000
-warmup_steps = 10_000
+warmup_steps = 1000
 train_every = 1
+batch_size = 64
+display_every_episodes = 100
 
 print_every_episodes = 10
-
 device = "cuda" if torch.cuda.is_available() else "cpu"
 print("Using device:", device)
-
 
 # =====================
 # Environment
@@ -67,46 +38,58 @@ print("Using device:", device)
 env = gym.make("LunarLander-v3")
 env = gym.wrappers.RecordEpisodeStatistics(env, buffer_length=10_000)
 
+def display_episode(agent):
+    display_env = gym.make("LunarLander-v3", render_mode="human")
+    obs, info = display_env.reset()
+    done = False
+    while not done:
+        action = agent.select_action(obs, deterministic=True)
+        next_obs, reward, terminated, truncated, info = display_env.step(action)
+        done = terminated or truncated
+        obs = next_obs
+    display_env.close()
 
 # =====================
-# Agent & Trainer
+# Initialize Components
 # =====================
-agent = ActionValueNetwork(
+algo = DQN(
     obs_dim=env.observation_space.shape[0],
     act_dim=env.action_space.n,
-    hidden_dim=128
-).to(device)
-
-trainer = DQNTrainer(
-    model=agent,
+    hidden_dim=128,
+    lr=learning_rate,
     gamma=gamma,
     target_update_freq=target_update_freq,
-    device=device,
-    lr=learning_rate,
-    optimizer=torch.optim.Adam,
-    epsilon=start_epsilon,
+    grad_clip_norm=grad_clip_norm,
+    device=device
+)
+
+agent = DQNAgent(
+    algorithm=algo,
+    action_space=env.action_space,
+    initial_epsilon=start_epsilon,
     epsilon_decay=epsilon_decay,
     final_epsilon=final_epsilon,
-    grad_clip_norm=grad_clip_norm
+    device=device
 )
 
 memory = ReplayBuffer(capacity=replay_capacity)
 
+trainer = Trainer(
+    env=env,
+    agent=agent,
+    memory=memory,
+    batch_size=batch_size,
+    warmup_steps=warmup_steps,
+    train_every=train_every,
+    device=device
+)
 
 # =====================
-# Logging buffers
+# Logging
 # =====================
-window = 100
-recent_returns = deque(maxlen=window)
-recent_lengths = deque(maxlen=window)
-recent_losses = deque(maxlen=window)
-recent_q_taken = deque(maxlen=window)
-recent_q_max = deque(maxlen=window)
-recent_rewards = deque(maxlen=window)
-
-global_step = 0
+recent_returns = deque(maxlen=100)
+recent_losses = deque(maxlen=100)
 start_time = time.time()
-
 
 # =====================
 # Training loop
@@ -114,99 +97,27 @@ start_time = time.time()
 for episode in range(1, n_episodes + 1):
     obs, info = env.reset()
     done = False
-
-    ep_reward_sum = 0.0
-    ep_len = 0
-
-    q_taken_sum = 0.0
-    q_max_sum = 0.0
-    q_count = 0
-
+    ep_reward = 0
+    
+    if episode % display_every_episodes == 0:
+        display_episode(agent)
+        
     while not done:
-        # Q prediction (model output, NOT real reward)
-        with torch.no_grad():
-            obs_t = torch.tensor(obs, dtype=torch.float32, device=device)
-            q_values = agent(obs_t)
-            q_max = q_values.max().item()
+        obs, reward, done, info, loss = trainer.train_one_step(obs)
+        ep_reward += reward
+        if loss is not None:
+            recent_losses.append(loss)
 
-        action = trainer.get_action(obs)
-
-        with torch.no_grad():
-            q_taken = q_values[action].item()
-
-        next_obs, reward, terminated, truncated, info = env.step(action)
-        done = terminated or truncated
-
-        memory.push(obs, action, reward, next_obs, done)
-
-        obs = next_obs
-        ep_reward_sum += reward
-        ep_len += 1
-        global_step += 1
-
-        q_taken_sum += q_taken
-        q_max_sum += q_max
-        q_count += 1
-        recent_rewards.append(reward)
-
-        # training
-        if len(memory) >= warmup_steps and global_step % train_every == 0:
-            out = trainer.experience_replay(memory)
-            metrics = unpack_train_result(out)
-            if "loss" in metrics and metrics["loss"] is not None:
-                recent_losses.append(metrics["loss"])
-
-    # real episode return (ground-truth)
     if "episode" in info:
-        ep_return = float(info["episode"]["r"])
-        ep_length = int(info["episode"]["l"])
+        recent_returns.append(float(info["episode"]["r"]))
     else:
-        ep_return = ep_reward_sum
-        ep_length = ep_len
+        recent_returns.append(ep_reward)
 
-    recent_returns.append(ep_return)
-    recent_lengths.append(ep_length)
+    agent.decay_epsilon()
 
-    if q_count > 0:
-        recent_q_taken.append(q_taken_sum / q_count)
-        recent_q_max.append(q_max_sum / q_count)
-
-    trainer.epsilon_decay_func()
-
-    # =====================
     # Print logs
-    # =====================
     if episode % print_every_episodes == 0:
         elapsed = time.time() - start_time
-        sps = global_step / elapsed if elapsed > 0 else 0.0
-
-        avg_return = sum(recent_returns) / len(recent_returns)
-        avg_len = sum(recent_lengths) / len(recent_lengths)
-        avg_loss = (
-            sum(recent_losses) / len(recent_losses)
-            if len(recent_losses) > 0 else float("nan")
-        )
-        avg_q_taken = (
-            sum(recent_q_taken) / len(recent_q_taken)
-            if len(recent_q_taken) > 0 else float("nan")
-        )
-        avg_q_max = (
-            sum(recent_q_max) / len(recent_q_max)
-            if len(recent_q_max) > 0 else float("nan")
-        )
-        avg_r_step = sum(recent_rewards) / len(recent_rewards)
-
-        print(
-            f"[Ep {episode:6d}] "
-            f"Ret {ep_return:7.1f} | "
-            f"AvgRet100 {avg_return:7.1f} | "
-            f"Len {ep_length:4d} | "
-            f"Eps {trainer.epsilon:5.3f} | "
-            f"Loss {avg_loss:8.4f} | "
-            f"Q(a) {avg_q_taken:7.2f} | "
-            f"Qmax {avg_q_max:7.2f} | "
-            f"R/step {avg_r_step:6.3f} | "
-            f"SPS {sps:7.1f}"
-        )
-
-env.close()
+        avg_return = np.mean(recent_returns) if recent_returns else 0
+        avg_loss = np.mean(recent_losses) if recent_losses else 0
+        print(f"Episode {episode} | Return: {avg_return:.2f} | Loss: {avg_loss:.4f} | Epsilon: {agent.epsilon:.3f} | Time: {elapsed:.1f}s")
