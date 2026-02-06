@@ -7,24 +7,17 @@ class ReplayBuffer:
     def __init__(self, capacity):
         self.buffer = deque(maxlen=capacity)
 
-    def push(self, obs, act, rew, next_obs, done):
-        self.buffer.append((obs, act, rew, next_obs, done))
+    def push(self, trajectory):
+        self.buffer.append(trajectory)
 
     def sample(self, batch_size):
-        batch = random.sample(self.buffer, batch_size)
-        obs, act, rew, next_obs, done = zip(*batch)
-        return (
-            np.array(obs),
-            np.array(act),
-            np.array(rew),
-            np.array(next_obs),
-            np.array(done)
-        )
+        trajectories = random.sample(self.buffer, batch_size)
+        return trajectories
 
     def __len__(self):
         return len(self.buffer)
 
-class Trainer:
+class BaseTrainer:
     def __init__(
         self,
         env,
